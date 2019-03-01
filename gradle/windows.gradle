@@ -17,8 +17,8 @@ kotlin {
             implementation "org.jetbrains.kotlinx:atomicfu:$atomic_fu_version"
         }
 
+        windowsTest
         windowsMain { dependsOn commonMain }
-        windowsTest { dependsOn windowsMain }
 
         if (!project.ext.ideaActive) {
             configure([mingwX64Main]) {

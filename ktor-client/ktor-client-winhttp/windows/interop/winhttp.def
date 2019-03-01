@@ -5,13 +5,13 @@ linkerOpts = -lwinhttp
 
 ---
 static unsigned int GetHResultFromError(unsigned int errorCode) {
-    int hr;
+    int result;
     if (errorCode < 0) {
-        hr = errorCode;
+        result = errorCode;
     }
     else {
-        hr = (int)(((unsigned int)errorCode & 0x0000FFFF) | (7 << 16) | 0x80000000);
+        result = (int)(((unsigned int)errorCode & 0x0000FFFF) | (7 << 16) | 0x80000000);
     }
 
-    return hr;
+    return result;
 }

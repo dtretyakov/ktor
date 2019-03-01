@@ -118,4 +118,5 @@ internal class WinHttpClientEngine(override val config: WinHttpClientEngineConfi
     }
 }
 
+@Suppress("KDocMissingDocumentation")
 class WinHttpIllegalStateException(cause: String) : IllegalStateException(cause)

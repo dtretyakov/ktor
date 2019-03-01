@@ -7,7 +7,7 @@ import kotlin.native.concurrent.ThreadLocal
 private val initHook = WinHttp
 
 /**
- * [HttpClientEngineFactory] using a curl library in implementation
+ * [HttpClientEngineFactory] using a [WinHttp] in implementation
  * with the the associated configuration [HttpClientEngineConfig].
  */
 object WinHttp : HttpClientEngineFactory<HttpClientEngineConfig> {
