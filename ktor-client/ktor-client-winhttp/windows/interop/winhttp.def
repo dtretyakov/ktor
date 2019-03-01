@@ -1,0 +1,17 @@
+package = winhttp
+headers = minwindef.h minwinbase.h winhttp.h
+compilerOpts = -DUNICODE
+linkerOpts = -lwinhttp
+
+---
+static unsigned int GetHResultFromError(unsigned int errorCode) {
+    int hr;
+    if (errorCode < 0) {
+        hr = errorCode;
+    }
+    else {
+        hr = (int)(((unsigned int)errorCode & 0x0000FFFF) | (7 << 16) | 0x80000000);
+    }
+
+    return hr;
+}
