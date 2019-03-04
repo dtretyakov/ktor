@@ -1,10 +1,21 @@
 apply plugin: "kotlinx-serialization"
 
 kotlin {
-    mingwX64('windows').compilations.main {
-        cinterops {
-            winHttp {
-                defFile project.file("windows/interop/winhttp.def")
+    targets {
+        def current = []
+        if (project.ext.ideaActive) {
+            current = [windows]
+        } else {
+            current = [mingwX64]
+        }
+
+        configure(current) { platform ->
+            platform.compilations.main {
+                cinterops {
+                    winHttp {
+                        defFile project.file("windows/interop/winhttp.def")
+                    }
+                }
             }
         }
     }
