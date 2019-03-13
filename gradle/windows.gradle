@@ -5,7 +5,7 @@ kotlin {
         if (project.ext.ideaActive) {
             fromPreset(project.ext.ideaPreset, 'windows')
         } else {
-            fromPreset(presets.mingwX64, 'windows')
+            fromPreset(presets.mingwX64, 'mingwX64')
         }
     }
     sourceSets {

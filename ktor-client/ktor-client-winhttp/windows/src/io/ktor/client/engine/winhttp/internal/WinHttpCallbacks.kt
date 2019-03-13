@@ -16,9 +16,7 @@ fun statusCallback(
     initRuntimeIfNeeded()
 
     val context = dwContext.toLong().toCPointer<COpaque>()?.asStableRef<WinHttpContext>()?.get()
-    if (context?.isDisposed != false) {
-        return
-    }
+    if (context?.isDisposed != false) return
 
     when (dwStatus) {
         WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE.convert<UInt>() -> {
