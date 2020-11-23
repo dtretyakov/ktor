@@ -11,6 +11,15 @@ import kotlinx.coroutines.*
  */
 public actual interface DefaultWebSocketSession : WebSocketSession {
     /**
+     * Ping interval or `-1L` to disable pinger. Please note that pongs will be handled despite of this setting.
+     */
+    public var pingIntervalMillis: Long
+    /**
+     * A timeout to wait for pong reply to ping otherwise the session will be terminated immediately.
+     * It doesn't have any effect if [pingIntervalMillis] is `-1` (pinger is disabled).
+     */
+    public var timeoutMillis: Long
+    /**
      * A close reason for this session. It could be `null` if a session is terminated with no close reason
      * (for example due to connection failure).
      */
@@ -20,8 +29,11 @@ public actual interface DefaultWebSocketSession : WebSocketSession {
 /**
  * Create [DefaultWebSocketSession] from session.
  */
+@OptIn(WebSocketInternalAPI::class)
 public actual fun DefaultWebSocketSession(
     session: WebSocketSession,
     pingInterval: Long,
     timeoutMillis: Long
-): DefaultWebSocketSession = error("There is no CIO native websocket implementation. Consider using platform default.")
+): DefaultWebSocketSession = DefaultWebSocketSessionNativeImpl(
+    session, pingInterval, timeoutMillis
+)
