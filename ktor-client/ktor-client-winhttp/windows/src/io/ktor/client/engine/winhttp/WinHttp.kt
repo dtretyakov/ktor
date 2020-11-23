@@ -1,22 +1,27 @@
+/*
+ * Copyright 2014-2020 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+ */
+
 package io.ktor.client.engine.winhttp
 
 import io.ktor.client.engine.*
-import kotlin.native.concurrent.ThreadLocal
 
-@ThreadLocal
 private val initHook = WinHttp
 
 /**
  * [HttpClientEngineFactory] using a [WinHttp] in implementation
  * with the the associated configuration [HttpClientEngineConfig].
  */
-object WinHttp : HttpClientEngineFactory<HttpClientEngineConfig> {
-
+public object WinHttp : HttpClientEngineFactory<WinHttpEngineConfig> {
     init {
-        engines.add(this)
+        engines.append(this)
     }
 
-    override fun create(block: HttpClientEngineConfig.() -> Unit): HttpClientEngine {
-        return WinHttpClientEngine(WinHttpClientEngineConfig().apply(block))
+    override fun create(block: WinHttpEngineConfig.() -> Unit): HttpClientEngine {
+        return WinHttpEngine(WinHttpEngineConfig().apply(block))
+    }
+
+    override fun toString(): String {
+        return "WinHTTP"
     }
 }

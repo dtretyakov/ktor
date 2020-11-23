@@ -21,12 +21,10 @@ kotlin {
             current.add(getByName("mingwX64"))
         }
 
-        val paths = listOf("C:/Tools/msys64/mingw64/x86_64-w64-mingw32/include")
         current.filterIsInstance<KotlinNativeTarget>().forEach { platform ->
             platform.compilations.getByName("main") {
                 val winhttp by cinterops.creating {
                     defFile = File(projectDir, "windows/interop/winhttp.def")
-                    includeDirs(paths)
                 }
             }
         }

@@ -1,6 +1,10 @@
+/*
+ * Copyright 2014-2020 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+ */
+
 package io.ktor.client.engine.winhttp
 
-enum class WinHttpSecurityProtocol(val value: Int) {
+public enum class WinHttpSecurityProtocol(internal val value: Int) {
     Default(0),
     Tls10(0x00000080),
     Tls11(0x00000200),

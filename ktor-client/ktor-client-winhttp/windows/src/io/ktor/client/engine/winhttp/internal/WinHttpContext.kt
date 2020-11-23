@@ -1,283 +1,161 @@
+/*
+ * Copyright 2014-2020 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
+ */
+
 package io.ktor.client.engine.winhttp.internal
 
-import io.ktor.client.engine.winhttp.WinHttpIllegalStateException
-import kotlinx.atomicfu.atomic
+import io.ktor.client.engine.winhttp.*
+import kotlinx.atomicfu.*
 import kotlinx.cinterop.*
 import kotlinx.coroutines.*
 import platform.windows.*
-import winhttp.*
+import kotlin.coroutines.*
+import kotlin.native.concurrent.*
 
 internal class WinHttpContext(
-    private val hRequest: COpaquePointer,
-    private val asyncWorkingMode: Boolean
-) : DisposableHandle {
-    private val reference: StableRef<WinHttpContext> = StableRef.create(this)
+    hConnect: COpaquePointer,
+    hRequest: COpaquePointer,
+    private val callContext: CoroutineContext,
+    val isUpgradeRequest: Boolean
+) : WinHttpContextBase(hConnect, hRequest) {
+    private val reference = StableRef.create(this)
 
-    private var sendRequestResult = CompletableDeferred<Unit>()
-    private var writeDataResult = CompletableDeferred<Unit>()
-    private var receiveResponseResult = CompletableDeferred<WinHttpResponseData>()
-    private var queryDataAvailableResult = CompletableDeferred<Long>()
-    private var readDataResult = CompletableDeferred<Int>()
-    private var stage = Stage.SendRequest
-    private var disposed = atomic(false)
+    private val sendRequestResult = CompletableDeferred<Unit>()
+    private val writeDataResult = atomic(CompletableDeferred<Unit>())
+    private val receiveResponseResult = CompletableDeferred<WinHttpResponseData>()
 
-    val isDisposed: Boolean
-        get() = disposed.value
+    private val webSocket = atomic<WinHttpWebSocket?>(null)
+    private val httpResponse = atomic<WinHttpResponseBody?>(null)
 
-    fun reject(error: String) {
-        if (!asyncWorkingMode) return
+    private val closed = atomic(false)
 
-        dispose()
+    val isClosed: Boolean
+        get() = closed.value
 
-        val exception = WinHttpIllegalStateException(error)
-
-        when (stage) {
-            Stage.SendRequest -> sendRequestResult.completeExceptionally(exception)
-            Stage.WriteData -> writeDataResult.completeExceptionally(exception)
-            Stage.ReceiveResponse -> receiveResponseResult.completeExceptionally(exception)
-            Stage.QueryDataAvailable -> queryDataAvailableResult.completeExceptionally(exception)
-            Stage.ReadData -> readDataResult.completeExceptionally(exception)
-        }
+    init {
+        freeze()
     }
 
-    fun enableHttp2Protocol() {
-        memScoped {
-            val flags = alloc<UIntVar> {
-                value = WINHTTP_PROTOCOL_FLAG_HTTP2.convert()
-            }
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, flags.ptr, UINT_SIZE)
+    fun sendRequestAsync(): Deferred<Unit> {
+        // Set status callback
+        val callback = staticCFunction(::statusCallback)
+        val notifications = WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS.convert<UInt>()
+        if (WinHttpSetStatusCallback(hRequest, callback, notifications, 0) != null) {
+            throw createWinHttpError("Unable to set request callback")
         }
+
+        // Send request
+        val reference = reference.asCPointer().rawValue.toLong()
+        if (WinHttpSendRequest(hRequest, null, 0, null, 0, 0, reference.convert()) == 0) {
+            throw createWinHttpError("Unable to send request")
+        }
+
+        return sendRequestResult
     }
 
     fun onSendRequestComplete() {
         sendRequestResult.complete(Unit)
     }
 
-    fun onWriteDataComplete() {
-        writeDataResult.complete(Unit)
+    fun writeDataAsync(body: Pinned<ByteArray>, size: Int = body.get().size): Deferred<Unit> {
+        // Write request body
+        if (WinHttpWriteData(hRequest, body.addressOf(0), size.convert(), null) == 0) {
+            throw createWinHttpError("Unable to write request data")
+        }
+
+        return writeDataResult.value
     }
 
-    fun onReceiveResponse() {
+    fun onWriteComplete() {
+        // Request body write completed
+        if (!receiveResponseResult.isCompleted) {
+            writeDataResult.getAndSet(CompletableDeferred()).complete(Unit)
+            return
+        }
+
+        // WebSocket frame was sent
+        if (isUpgradeRequest) {
+            webSocket.value?.onSendFrame()
+        }
+    }
+
+    fun receiveResponseAsync(): Deferred<WinHttpResponseData> {
+        // Receive HTTP response
+        if (WinHttpReceiveResponse(hRequest, null) == 0) {
+            throw createWinHttpError("Unable to receive response")
+        }
+
+        return receiveResponseResult
+    }
+
+    fun onHeadersAvailable() {
         try {
-            receiveResponseResult.complete(getResponseData())
+            val responseData = getResponseData {
+                if (isUpgradeRequest) {
+                    // Create WebSocket response
+                    WinHttpWebSocket(hRequest, callContext, reference.asCPointer()).also {
+                        webSocket.value = it
+                    }
+                } else {
+                    // Creating HTTP body response
+                    WinHttpResponseBody(hRequest, callContext).also {
+                        httpResponse.value = it
+                    }.body
+                }
+            }
+            receiveResponseResult.complete(responseData)
         } catch (e: Throwable) {
             receiveResponseResult.completeExceptionally(e)
+            return
+        }
+
+        // Start response body producers
+        if (isUpgradeRequest) {
+            webSocket.value?.start()
+        } else {
+            httpResponse.value?.start()
         }
     }
 
-    fun onQueryDataAvailable(size: Long) {
-        queryDataAvailableResult.complete(size)
-    }
-
-    fun onReadComplete(size: Int) {
-        readDataResult.complete(size)
-    }
-
-    private fun getLength(dwSize: UIntVar) = (dwSize.value / ShortVar.size.convert()).convert<Int>()
-
-
-    private fun getHeader(headerId: Int): String? = memScoped {
-        val dwSize = alloc<UIntVar>()
-
-        // Get headers length
-        if (WinHttpQueryHeaders(hRequest, headerId.convert(), null, null, dwSize.ptr, null) == 0) {
-            val errorCode = GetLastError()
-            if (errorCode != ERROR_INSUFFICIENT_BUFFER.convert<UInt>()) {
-                throw createWinHttpError("Unable to query response headers length")
-            }
+    fun onDataAvailable(availableBytes: Int) {
+        if (availableBytes <= 0) {
+            close()
+            return
         }
 
-        // Read headers into buffer
-        val buffer = allocArray<ShortVar>(getLength(dwSize) + 1)
-        if (WinHttpQueryHeaders(hRequest, headerId.convert(), null, buffer, dwSize.ptr, null) == 0) {
-            throw createWinHttpError("Unable to query response headers")
-        }
-
-        String(CharArray(getLength(dwSize)) {
-            buffer[it].toChar()
-        })
+        httpResponse.value?.readData(availableBytes)
     }
 
-    private fun isResponseHttp2(): Boolean = memScoped {
-        val flags = alloc<UIntVar>()
-        val dwSize = alloc<UIntVar> {
-            value = UINT_SIZE
-        }
-        val flagsFetched = WinHttpQueryOption(hRequest, WINHTTP_OPTION_HTTP_PROTOCOL_USED, flags.ptr, dwSize.ptr) != 0
-        val isHttp2 = flags.value.convert<Int>() and WINHTTP_PROTOCOL_FLAG_HTTP2 != 0
-        return flagsFetched && isHttp2
+    fun onReadComplete(readBytes: Int) {
+        httpResponse.value?.onReadComplete(readBytes)
     }
 
-    override fun dispose() {
-        if (disposed.getAndSet(true)) return
+    fun onFrameReceived(status: WINHTTP_WEB_SOCKET_STATUS) {
+        webSocket.value?.onReceiveFrame(status)
+    }
+
+    fun onDisconnect() {
+        webSocket.value?.onDisconnect()
+    }
+
+    fun onError(message: String) {
+        val cause = WinHttpIllegalStateException(message)
+        close(cause)
+    }
+
+    override fun close() {
+        close(null)
+    }
+
+    private fun close(cause: Exception?) {
+        if (!closed.compareAndSet(expect = false, update = true)) return
+
         WinHttpSetStatusCallback(hRequest, null, 0, 0)
+
+        webSocket.value?.close(cause)
+        httpResponse.value?.close(cause)
+
+        super.close()
         reference.dispose()
     }
-
-    private enum class Stage {
-        SendRequest,
-        WriteData,
-        ReceiveResponse,
-        QueryDataAvailable,
-        ReadData
-    }
-
-    companion object {
-        private const val WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL = 133u
-        private const val WINHTTP_OPTION_HTTP_PROTOCOL_USED = 134u
-        private const val WINHTTP_PROTOCOL_FLAG_HTTP2 = 0x1
-
-        private val UINT_SIZE: UInt = sizeOf<UIntVar>().convert()
-    }
 }
-
-internal inline class WinHttpSyncContext(private val hRequest: COpaquePointer) {
-    fun sendRequest() {
-        hRequest.sendRequestInternal()
-    }
-
-    fun writeData(body: Pinned<ByteArray>) {
-        hRequest.writeDataInternal(body)
-    }
-
-    fun readData(buffer: Pinned<ByteArray>): Int = memScoped {
-        val numberOfBytesRead = alloc<UIntVar>()
-
-        if (WinHttpReadData(
-                hRequest,
-                buffer.addressOf(0),
-                buffer.get().size.convert(),
-                numberOfBytesRead.ptr
-            ) == 0
-        ) {
-            throw createWinHttpError("Unable to read response data")
-        }
-
-        numberOfBytesRead.value.convert()
-    }
-
-    fun queryDataAvailable(): Long = memScoped {
-        val numberOfBytesAvailable = alloc<UIntVar>()
-
-        if (WinHttpQueryDataAvailable(hRequest, numberOfBytesAvailable.ptr) == 0) {
-            throw createWinHttpError("Unable to query data length")
-        }
-
-        numberOfBytesAvailable.value.convert()
-    }
-
-    fun receiveResponse(): WinHttpResponseData {
-        hRequest.receiveResponseInternal()
-        return getResponseData()
-    }
-
-}
-
-internal inline class WinHttpAsyncContext(private val hRequest: COpaquePointer) {
-
-    suspend fun readDataAsync(buffer: Pinned<ByteArray>): Int = suspendCancellableCoroutine {
-        if (WinHttpReadData(hRequest, buffer.addressOf(0), buffer.get().size.convert(), null) == 0) {
-            throw createWinHttpError("Unable to read response data")
-        }
-
-//        stage = Stage.ReadData
-//        readDataResult = CompletableDeferred()
-//
-//        return readDataResult
-    }
-
-    fun queryDataAvailableAsync(): Deferred<Long> {
-        if (WinHttpQueryDataAvailable(hRequest, null) == 0) {
-            throw createWinHttpError("Unable to query data length")
-        }
-
-//        stage = Stage.QueryDataAvailable
-//        queryDataAvailableResult = CompletableDeferred()
-//
-//        return queryDataAvailableResult
-        TODO()
-    }
-
-    fun sendRequestAsync(): Deferred<Unit> {
-//        stage = Stage.SendRequest
-//        sendRequestResult = CompletableDeferred()
-
-        hRequest.sendRequestInternal()
-        TODO()
-//        return sendRequestResult
-    }
-
-    suspend fun receiveResponseAsync(): WinHttpResponseData {
-//        stage = Stage.ReceiveResponse
-//        receiveResponseResult = CompletableDeferred()
-
-        hRequest.receiveResponseInternal()
-
-        TODO()
-//        return receiveResponseResult
-    }
-}
-
-private fun COpaquePointer.sendRequestInternal() {
-    // Set status callback
-    val function = staticCFunction(::statusCallback)
-    val notifications = TODO() /* WTF? if (asyncWorkingMode) {
-        WINHTTP_CALLBACK_STATUS_SECURE_FAILURE or WINHTTP_CALLBACK_STATUS_SECURE_FAILURE
-    } else WINHTTP_CALLBACK_STATUS_SECURE_FAILURE
-    */
-
-    if (WinHttpSetStatusCallback(this, function, notifications.convert(), 0) != null) {
-        throw createWinHttpError("Unable to set request callback")
-    }
-
-    // Send request
-//    val reference = reference.asCPointer().rawValue.toLong().convert<ULong>()
-//    if (WinHttpSendRequest(this, null, 0, null, 0, 0, reference) == 0) {
-//        throw createWinHttpError("Unable to send request")
-//    }
-}
-
-private fun COpaquePointer.writeDataInternal(body: Pinned<ByteArray>) {
-    // Write request data
-    if (WinHttpWriteData(this, body.addressOf(0), body.get().size.convert(), null) == 0) {
-        throw createWinHttpError("Unable to write request data")
-    }
-}
-
-private fun COpaquePointer.receiveResponseInternal() {
-    if (WinHttpReceiveResponse(this, null) == 0) {
-        throw createWinHttpError("Unable to receive response")
-    }
-}
-
-private fun getResponseData(): WinHttpResponseData = memScoped {
-    val dwStatusCode = alloc<UIntVar>()
-    val dwSize = alloc<UIntVar> {
-        value = UINT_SIZE
-    }
-
-    // Get status code
-    val statusCodeFlags = WINHTTP_QUERY_STATUS_CODE or WINHTTP_QUERY_FLAG_NUMBER
-    if (WinHttpQueryHeaders(
-            hRequest,
-            statusCodeFlags.convert(),
-            null,
-            dwStatusCode.ptr,
-            dwSize.ptr,
-            null
-        ) == 0
-    ) {
-        throw createWinHttpError("Unable to query status code")
-    }
-
-    val statusCode = dwStatusCode.value.convert<Int>()
-    val httpVersion = if (isResponseHttp2()) {
-        "HTTP/2.0"
-    } else {
-        getHeader(WINHTTP_QUERY_VERSION) ?: "HTTP/1.1"
-    }
-    val headers = getHeader(WINHTTP_QUERY_RAW_HEADERS_CRLF) ?: ""
-
-    WinHttpResponseData(statusCode, httpVersion, headers)
-}
-
