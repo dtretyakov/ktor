@@ -20,6 +20,8 @@ internal class CurlWebSocketResponseBody(
     private val closed = atomic(false)
     private val _incoming = Channel<Frame>(Channel.UNLIMITED)
 
+    private var partialFragBuffer = byteArrayOf()
+
     val incoming: ReceiveChannel<Frame>
         get() = _incoming
 
@@ -41,9 +43,16 @@ internal class CurlWebSocketResponseBody(
 
         val bytesRead = (size * count).toInt()
         val meta = curl_ws_meta(curl)?.pointed ?: error("Missing metadata")
-        val frameData = buffer.readBytes(bytesRead)
 
-        onFrame(frameData, meta.flags)
+        partialFragBuffer += buffer.readBytes(bytesRead)
+
+        // In-case of large payloads being received, libcurl will call the write
+        // callback multiple times with partial fragments that will not have
+        // the CURLWS_CONT bit set, so we buffer internally
+        if (meta.bytesleft == 0L) {
+          onFrame(partialFragBuffer, meta.flags)
+          partialFragBuffer = byteArrayOf()
+        }
 
         return bytesRead
     }
